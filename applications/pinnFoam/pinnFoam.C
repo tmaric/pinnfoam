@@ -53,6 +53,7 @@ Description
 #include "fileNameGenerator.H"
 
 using namespace Foam;
+using namespace torch::indexing;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -159,137 +160,94 @@ int main(int argc, char *argv[])
         nn->push_back(torch::nn::GELU()); 
     }
     // - Output is 1D: value of the learned scalar field. 
-    // FIXME: generalize here for vector / scalar input. TM.
+    // TODO: generalize here for vector / scalar data. 
     nn->push_back(
         torch::nn::Linear(hiddenLayers[hiddenLayers.size() - 1], 1)
     );
     
     // Initialize training data 
     
-    // - Cell labels
-    std::vector<int> cellLabels;
-    std::vector<int> trainingLabels;
-    std::vector<int> validationLabels;
+    // - Reinterpreting OpenFOAM's fileds as torch::tensors without copying
+    //  - Reinterpret OpenFOAM's input volScalarField as scalar* array 
+    volScalarField::pointer vf_data = vf.ref().data();
+    //  - Use the scalar* (volScalarField::pointer) to view 
+    //    the volScalarField as torch::Tensor without copying data. 
+    torch::Tensor vf_tensor = torch::from_blob(vf_data, {vf.size(), 1});
+    //  - Reinterpret OpenFOAM's vectorField as vector* array 
+    volVectorField& cc = const_cast<volVectorField&>(mesh.C());
+    volVectorField::pointer cc_data = cc.ref().data();
+    //  - Use the scalar* (volScalarField::pointer) to view 
+    //    the volScalarField as torch::Tensor without copying data. 
+    torch::Tensor cc_tensor = torch::from_blob(cc_data, {cc.size(),3});
     
-    // - Training data
-    torch::Tensor trainingPoints; 
-    torch::Tensor trainingValues; 
-
-    // - Validation data
-    torch::Tensor validationPoints; 
-    torch::Tensor validationValues; 
+    // - Randomly shuffle cell center indices. 
+    torch::Tensor shuffled_indices = torch::randperm(
+        mesh.nCells(),
+        torch::TensorOptions().dtype(at::kLong)
+    ); 
+    // - Randomly select 10 % of all cell centers for training. 
+    long int n_cells = int(0.1 * mesh.nCells());
+    torch::Tensor training_indices = shuffled_indices.index({Slice(0, n_cells)}); 
     
-    // - Set data sizes: training a cell-centered field. 
-    cellLabels.resize(mesh.nCells());
-    std::iota(cellLabels.begin(), cellLabels.end(), 0);
-
-    // Split training and validation data
-    // - Use 90% from all cells for training
-    std::sample
-    (
-        cellLabels.begin(), 
-        cellLabels.end(), 
-        std::back_inserter(trainingLabels),
-        int(std::round(0.9 * cellLabels.size())), 
-        std::mt19937(std::random_device{}())
-    );
-    
-    // - Use 10% from all cells for validation 
-    std::sample
-    (
-        cellLabels.begin(), 
-        cellLabels.end(), 
-        std::back_inserter(validationLabels),
-        int(std::round(0.1 * cellLabels.size())), 
-        std::mt19937(std::random_device{}())
-    );
-    
-
-    // - Initialize training data 
-    trainingPoints = torch::zeros({static_cast<long>(trainingLabels.size()),3});
-    trainingValues = torch::zeros({static_cast<long>(trainingLabels.size()),1});
-
-    // - Assign training cell center and vf values to tensors.
-    const auto& cellcenters = vf.mesh().C();
-    for(decltype(trainingLabels.size()) i = 0; i < trainingLabels.size(); ++i)
-    {
-        const auto cellI = trainingLabels[i];
-        AI::assign(trainingPoints[i], cellcenters[cellI]);
-        trainingValues[i] = vf[cellI];
-    }
-
-    // - Initialize validation data 
-    validationPoints = torch::zeros({static_cast<long>(validationLabels.size()),3});
-    validationValues = torch::zeros({static_cast<long>(validationLabels.size()),1});
-
-    // - Assign validation cell center and vf values to tensors.
-    for(decltype(validationLabels.size()) i = 0; i < validationLabels.size(); ++i)
-    {
-        const auto cellI = validationLabels[i];
-        AI::assign(validationPoints[i], cellcenters[cellI]);
-        validationValues[i] = vf[cellI];
-    }
+    // - Use 10% of random indices to select the training_data from vf_tensor 
+    torch::Tensor vf_training = vf_tensor.index(training_indices);
+    vf_training.requires_grad_(true);
+    torch::Tensor cc_training = cc_tensor.index(training_indices);
+    cc_training.requires_grad_(true);
     
     // Train the network
-    torch::optim::RMSprop optimizer( 
-        nn->parameters(), 
-        optimizerStep
-    );
+    torch::optim::RMSprop optimizer(nn->parameters(), optimizerStep);
 
-    torch::Tensor trainingPrediction = torch::zeros_like(trainingValues);
-    torch::Tensor trainingMse = torch::zeros_like(trainingValues);
-
-    torch::Tensor validationPrediction = torch::zeros_like(validationValues);
-    torch::Tensor validationMse = torch::zeros_like(validationValues);
+    torch::Tensor vf_predict = torch::zeros_like(vf_training);
+    torch::Tensor mse = torch::zeros_like(vf_training);
     
     size_t epoch = 1;
-    double trainingMseMean = 0.,
-           trainingMseMax = 0.,
-           validationMseMean = 0.,
-           validationMseMax = 0.;
+    double min_mse = 1.; 
 
     // - Approximate DELTA_X on unstructured meshes
     const auto& deltaCoeffs = mesh.deltaCoeffs().internalField();
     double delta_x = Foam::pow(
         Foam::min(deltaCoeffs).value(),-1
     );
-
-
+    
     // - Open the data file for writing
     auto file_name = getAvailableFileName("pinnFoam");   
     std::ofstream dataFile (file_name);
     dataFile << "HIDDEN_LAYERS,OPTIMIZER_STEP,EPSILON,MAX_ITERATIONS,"
-        << "DELTA_X,EPOCH,"
-        << "TRAINING_MSE_MEAN,TRAINING_MSE_MAX,"
-        << "VALIDATION_MSE_MEAN,VALIDATION_MSE_MAX\n";
-     
+        << "DELTA_X,EPOCH,DATA_MSE,GRAD_MSE,TRAINING_MSE\n";
+
+    // - Initialize the best model (to be saved during training)
+    torch::nn::Sequential nn_best;
     for (; epoch <= maxIterations; ++epoch) 
     {
         // Training
         optimizer.zero_grad();
 
-        trainingPrediction = nn->forward(trainingPoints);
-        trainingMse = mse_loss(trainingPrediction, trainingValues);
+        vf_predict = nn->forward(cc_training);
 
-        trainingMse.backward(); 
+        auto vf_predict_grad = torch::autograd::grad(
+           {vf_predict},
+           {cc_training},
+           {torch::ones_like(vf_training)},
+           true
+        );
+        
+        auto mse_data = mse_loss(vf_predict, vf_training);
+        
+        auto mse_grad = mse_loss(
+            at::norm(vf_predict_grad[0], 2, -1), 
+            torch::ones_like(vf_training)
+        );
+
+        mse = mse_data + mse_grad; 
+
+        mse.backward(); 
         optimizer.step();
 
-        trainingMseMean = trainingMse.mean().item<double>();
-        trainingMseMax = trainingMse.max().item<double>();
-        
-        // Validation
-        validationPrediction = nn->forward(validationPoints);
-        validationMse = mse_loss(validationPrediction, validationValues);
-        validationMseMean = validationMse.mean().item<double>(); 
-        validationMseMax = validationMse.max().item<double>(); 
-
         std::cout << "Epoch = " << epoch << "\n"
-            << "Training MSE loss mean = " << trainingMseMean << "\n"
-            << "Training MSE loss max = " << trainingMseMax << "\n"
-            << "sqrt(Training MSE loss mean) = " << std::sqrt(trainingMseMean) << "\n"
-            << "Validation MSE loss mean = " << validationMseMean << "\n"
-            << "Validation MSE loss max = " << validationMseMax << "\n"
-            << "sqrt(Valiation MSE loss mean) = " << std::sqrt(validationMseMean) << "\n";  
+            << "Data MSE = " << mse_data.item<double>() << "\n"
+            << "Grad MSE = " << mse_grad.item<double>() << "\n"
+            << "Training MSE = " << mse.item<double>() << "\n";
         
         // Write the hiddenLayers_ network structure as a string-formatted python list.
         dataFile << "\"";
@@ -300,45 +258,36 @@ int main(int argc, char *argv[])
         // Write the rest of the data. 
         dataFile << optimizerStep << "," << epsilon << "," << maxIterations << "," 
             << delta_x << "," << epoch << "," 
-            << trainingMseMean << "," << trainingMseMax << "," 
-            << validationMseMean << "," << validationMseMax << "\n"; 
+            << mse_data.item<double>() << "," 
+            << mse_grad.item<double>() << ","
+            << mse.item<double>() << std::endl;
         
-        
-        if (trainingMseMean < epsilon)
+        if (mse.item<double>() < min_mse)
         {
-            break;
+            min_mse = mse.item<double>();
+            // Save the "best" model with the minimal MSE over all epochs.
+            nn_best = nn;
         }
     }
     
-    if (epoch >= maxIterations) 
-        std::cout << "Not converged, error = " 
-            << trainingMseMean << std::endl;
-    
-    Info<< nl;
-    runTime.printExecutionTime(Info);
-    
-    // Network evaluation. 
-    const auto& cell_centers = mesh.C(); 
-    torch::Tensor input_point = torch::zeros(3);
-    forAll(vf_nn, cellI)
-    {
-        AI::assign(input_point, cell_centers[cellI]);
-        vf_nn[cellI] = nn->forward(input_point).item<double>();
-    }
+    // Evaluate the best NN. 
+    //  - Reinterpret OpenFOAM's output volScalarField as scalar* array 
+    volScalarField::pointer vf_nn_data = vf_nn.ref().data();
+    //  - Use the scalar* (volScalarField::pointer) to view 
+    //    the volScalarField as torch::Tensor without copying data. 
+    torch::Tensor vf_nn_tensor = torch::from_blob(vf_nn_data, {vf.size()});
+    //  - Evaluate the volumeScalarField vf_nn using the best NN model.
+    vf_nn_tensor = nn_best->forward(cc_tensor);
+    //  - Evaluate the vf_nn boundary conditions. 
     vf_nn.correctBoundaryConditions();
-    
+
     // Error calculation and output.
     error_c = Foam::mag(vf - vf_nn);
-    scalar vfMaxMag = Foam::mag(Foam::max(vf)).value();
     scalar error_c_l_inf = Foam::max(error_c).value();  
-    scalar error_c_l_inf_rel = error_c_l_inf / vfMaxMag;
-    scalar error_c_mean_rel = Foam::average(error_c).value() / vfMaxMag;
+    scalar error_c_mean = Foam::average(error_c).value(); 
 
     Info << "max(|field - field_nn|) = " << error_c_l_inf << endl; 
-    Info << "max(|field - field_nn|)/|max(field)| = " 
-        << error_c_l_inf_rel << endl; 
-    Info << "mean(|field - field_nn|)/|max(field)| = " 
-        <<  error_c_mean_rel << endl; 
+    Info << "mean(|field - field_nn|) = " << error_c_mean << endl; 
     
     // Write fields
     error_c.write();

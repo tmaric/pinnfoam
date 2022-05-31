@@ -52,10 +52,10 @@ AI
 {
     // Uncomment when parameterizing 
     // via the dictionary. 
-    //maxIterations 1000;
-    //hiddenLayers (10 10 10 10);
-    //epsilon 1e-06;
-    //optimizerStep 0.01; 
+    maxIterations 1000;
+    hiddenLayers (10 10 10 10);
+    epsilon 1e-06;
+    optimizerStep 0.01; 
 
     sphere 
     {

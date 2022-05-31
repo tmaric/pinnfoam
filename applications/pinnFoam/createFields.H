@@ -1,3 +1,4 @@
+    #include "volFieldsFwd.H"
     volScalarField vf 
     (
         IOobject
@@ -25,4 +26,18 @@
         ),
         mesh, 
         dimensionedScalar("error_c", vf.dimensions(), 0)
+    );
+    
+    volVectorField gradvf_nn
+    (
+        IOobject
+        (
+            "gradvf_nn", 
+            runTime.timeName(), 
+            mesh, 
+            IOobject::NO_READ, 
+            IOobject::AUTO_WRITE
+        ),
+        mesh, 
+        dimensionedVector("gradvf_nn", vf.dimensions(), vector(0,0,0))
     );
