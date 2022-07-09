@@ -48,11 +48,11 @@ int main(int argc, char *argv[])
     scalar radius = sphereDict.get<scalar>("radius");
     vector center = sphereDict.get<vector>("center");
 
-    volScalarField psi_c 
+    volScalarField vf 
     (
         IOobject
         (
-            "psi_c",
+            "vf",
             runTime.timeName(), 
             mesh, 
             IOobject::MUST_READ,
@@ -63,12 +63,12 @@ int main(int argc, char *argv[])
     
     // Cell-centers
     const auto& C = mesh.C();
-    forAll(psi_c, cellI)
+    forAll(vf, cellI)
     {
-        psi_c[cellI] = Foam::mag(C[cellI] - center) - radius; 
+        vf[cellI] = Foam::mag(C[cellI] - center) - radius; 
     }
     
-    psi_c.write();
+    vf.write();
 
     // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 

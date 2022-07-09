@@ -3,7 +3,7 @@
     (
         IOobject
         (
-            "psi_c",
+            "vf",
             runTime.timeName(), 
             mesh, 
             IOobject::MUST_READ,
@@ -12,7 +12,7 @@
         mesh
     );
 
-    volScalarField vf_nn (vf.name() + "_nn", vf);
+    volScalarField vf_nn("vf_nn", vf);
 
     volScalarField error_c 
     (

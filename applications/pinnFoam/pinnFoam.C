@@ -68,13 +68,6 @@ int main(int argc, char *argv[])
 
     argList::addOption
     (
-        "approximator",
-        "string",
-        "Type name of the MLP field approximator."
-    );
-
-    argList::addOption
-    (
         "hiddenLayers",
         "int,int,int,...",
         "A sequence of hidden-layer depths."
@@ -85,13 +78,6 @@ int main(int argc, char *argv[])
         "optimizerStep",
         "double",
         "Step of the optimizer."
-    );
-
-    argList::addOption
-    (
-        "epsilon",
-        "<double>",
-        "Training error tolerance."
     );
 
     argList::addOption
@@ -113,20 +99,16 @@ int main(int argc, char *argv[])
     // - NN architecture 
     DynamicList<label> hiddenLayers;
     scalar optimizerStep;
-    // - Training error tolerance.
-    scalar epsilon;
     // - Maximal number of training iterations.
     std::size_t maxIterations;
     
     // - Initialize hyperparameters from command line arguments if they are provided
     if (args.found("hiddenLayers") && 
         args.found("optimizerStep") &&
-        args.found("epsilon") && 
         args.found("maxIterations"))
     {
         hiddenLayers = args.get<DynamicList<label>>("hiddenLayers");
         optimizerStep = args.get<scalar>("optimizerStep");
-        epsilon = args.get<scalar>("epsilon");
         maxIterations = args.get<label>("maxIterations");
     } 
     else // Initialize from system/fvSolution.AI.approximator sub-dict.
@@ -136,7 +118,6 @@ int main(int argc, char *argv[])
 
         hiddenLayers = aiDict.get<DynamicList<label>>("hiddenLayers");
         optimizerStep = aiDict.get<scalar>("optimizerStep");
-        epsilon = aiDict.get<scalar>("epsilon");
         maxIterations = aiDict.get<label>("maxIterations");
     }
     
@@ -157,7 +138,9 @@ int main(int argc, char *argv[])
         nn->push_back(
             torch::nn::Linear(hiddenLayers[L-1], hiddenLayers[L])
         );
+        // TODO: RTS Alternatives TM.
         nn->push_back(torch::nn::GELU()); 
+        //nn->push_back(torch::nn::Tanh()); 
     }
     // - Output is 1D: value of the learned scalar field. 
     // TODO: generalize here for vector / scalar data. 
@@ -213,7 +196,7 @@ int main(int argc, char *argv[])
     // - Open the data file for writing
     auto file_name = getAvailableFileName("pinnFoam");   
     std::ofstream dataFile (file_name);
-    dataFile << "HIDDEN_LAYERS,OPTIMIZER_STEP,EPSILON,MAX_ITERATIONS,"
+    dataFile << "HIDDEN_LAYERS,OPTIMIZER_STEP,MAX_ITERATIONS,"
         << "DELTA_X,EPOCH,DATA_MSE,GRAD_MSE,TRAINING_MSE\n";
 
     // - Initialize the best model (to be saved during training)
@@ -223,8 +206,10 @@ int main(int argc, char *argv[])
         // Training
         optimizer.zero_grad();
 
+        // Compute the prediction from the nn. 
         vf_predict = nn->forward(cc_training);
 
+        // Compute the gradient of the prediction w.r.t. input.
         auto vf_predict_grad = torch::autograd::grad(
            {vf_predict},
            {cc_training},
@@ -232,15 +217,19 @@ int main(int argc, char *argv[])
            true
         );
         
+        // Compute the data mse loss.
         auto mse_data = mse_loss(vf_predict, vf_training);
         
+        // Compute the gradient mse loss. 
         auto mse_grad = mse_loss(
             at::norm(vf_predict_grad[0], 2, -1), 
             torch::ones_like(vf_training)
         );
 
+        // Combine the losses into a Physics Informed Neural Network.
         mse = mse_data + mse_grad; 
 
+        // Optimize weights of the PiNN.
         mse.backward(); 
         optimizer.step();
 
@@ -256,7 +245,7 @@ int main(int argc, char *argv[])
         dataFile  << hiddenLayers[hiddenLayers.size() - 1] 
             << "\"" << ",";
         // Write the rest of the data. 
-        dataFile << optimizerStep << "," << epsilon << "," << maxIterations << "," 
+        dataFile << optimizerStep << "," << maxIterations << "," 
             << delta_x << "," << epoch << "," 
             << mse_data.item<double>() << "," 
             << mse_grad.item<double>() << ","
@@ -278,13 +267,27 @@ int main(int argc, char *argv[])
     torch::Tensor vf_nn_tensor = torch::from_blob(vf_nn_data, {vf.size()});
     //  - Evaluate the volumeScalarField vf_nn using the best NN model.
     vf_nn_tensor = nn_best->forward(cc_tensor);
+    //  - FIXME: 2022-06-01, the C++ PyTorch API does not overwrite the blob object.
+    //           If a Model is coded by inheritance, maybe forward(input, output) is
+    //           available, that overwrites the data in vf_nn by acting on the 
+    //           non-const view of the data given by vf_nn_tensor. TM.
+    forAll(vf_nn, cellI)
+    {
+        vf_nn[cellI] = vf_nn_tensor[cellI].item<double>();
+    }
     //  - Evaluate the vf_nn boundary conditions. 
     vf_nn.correctBoundaryConditions();
 
     // Error calculation and output.
-    error_c = Foam::mag(vf - vf_nn);
+    // - Data
+    error_c == Foam::mag(vf - vf_nn);
     scalar error_c_l_inf = Foam::max(error_c).value();  
     scalar error_c_mean = Foam::average(error_c).value(); 
+    // - Gradient  
+    volVectorField vf_grad ("vf_grad", fvc::grad(vf));
+    volVectorField vf_nn_grad ("vf_nn_grad", fvc::grad(vf_nn));
+    volScalarField error_grad_c ("error_grad_c", Foam::mag(vf_grad - vf_nn_grad));
+
 
     Info << "max(|field - field_nn|) = " << error_c_l_inf << endl; 
     Info << "mean(|field - field_nn|) = " << error_c_mean << endl; 
@@ -292,6 +295,9 @@ int main(int argc, char *argv[])
     // Write fields
     error_c.write();
     vf_nn.write();
+    vf_nn_grad.write();
+    vf_grad.write(); 
+    error_grad_c.write();
 
     Info<< "End\n" << endl;
 
