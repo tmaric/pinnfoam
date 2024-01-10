@@ -8,18 +8,18 @@ Tomislav Maric, MMA, Mathematics Department, TU Darmstadt, maric@mma.tu-darmstad
 
 ### Dependencies 
 
-* OpenFOAM-v2112
+* OpenFOAM-v2312
 * python Pandas, matplotlib
 
 ### Installation 
 
 ```
-   ofw17-training-physics-based-dl> ./Allwmake
+   pinnfoam> ./Allwmake
 ```
 
 ### Usage 
 
-In `ofw17-training-physics-based-dl/run/unit_box_domain`
+In `pinnfoam/run/unit_box_domain`
 
 ```
     unit_box_domain > blockMesh && pinnFoamSetSphere && pinnFoam 
